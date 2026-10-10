@@ -1,0 +1,5 @@
+# Pinned so the IR printed in docs/ matches what the tools produce.
+iree-base-compiler==3.12.0
+iree-base-runtime==3.12.0
+numpy==2.5.3
+pytest==9.1.1

@@ -1,0 +1,113 @@
+{
+  "name": "SAVA",
+  "version": "0.1",
+  "comment": "Single source of truth for the SAVA ISA. Consumed by tools/gen_isa_header.py (C++ simulator) and python/sava/isa.py (assembler, compiler).",
+
+  "encoding": {
+    "width_bits": 64,
+    "fields": {
+      "opcode": { "lsb": 56, "bits": 8 },
+      "rd":     { "lsb": 51, "bits": 5 },
+      "rs1":    { "lsb": 46, "bits": 5 },
+      "rs2":    { "lsb": 41, "bits": 5 },
+      "rs3":    { "lsb": 36, "bits": 5 },
+      "imm":    { "lsb": 0,  "bits": 32 }
+    }
+  },
+
+  "registers": {
+    "count": 32,
+    "width_bits": 64,
+    "aliases": {
+      "zero": 0,
+      "a0": 1, "a1": 2, "a2": 3, "a3": 4, "a4": 5, "a5": 6, "a6": 7, "a7": 8
+    }
+  },
+
+  "csrs": [
+    { "name": "DMA_ROWS",        "id": 0,  "access": "rw", "desc": "Number of rows moved by dma.ld / dma.st." },
+    { "name": "DMA_ROW_BYTES",   "id": 1,  "access": "rw", "desc": "Bytes per row moved by dma.ld / dma.st." },
+    { "name": "DMA_SRAM_STRIDE", "id": 2,  "access": "rw", "desc": "Distance in bytes between consecutive rows in SRAM." },
+    { "name": "DMA_DRAM_STRIDE", "id": 3,  "access": "rw", "desc": "Distance in bytes between consecutive rows in DRAM." },
+    { "name": "MXU_M",           "id": 8,  "access": "rw", "desc": "Rows of A and C for mxu.mm." },
+    { "name": "MXU_N",           "id": 9,  "access": "rw", "desc": "Columns of B and C for mxu.mm." },
+    { "name": "MXU_K",           "id": 10, "access": "rw", "desc": "Reduction dimension for mxu.mm." },
+    { "name": "MXU_LDA",         "id": 11, "access": "rw", "desc": "Row stride of A in bytes." },
+    { "name": "MXU_LDB",         "id": 12, "access": "rw", "desc": "Row stride of B in bytes." },
+    { "name": "MXU_LDC",         "id": 13, "access": "rw", "desc": "Row stride of C in bytes." },
+    { "name": "MXU_DTYPE",       "id": 14, "access": "rw", "desc": "Input element type of A and B: 0 = f32, 1 = bf16. C is always f32." },
+    { "name": "VPU_LEN",         "id": 16, "access": "rw", "desc": "Number of elements processed by v.* instructions." },
+    { "name": "CYCLE",           "id": 24, "access": "ro", "desc": "Current core cycle counter." },
+    { "name": "CORE_ID",         "id": 25, "access": "ro", "desc": "Index of this core in the cluster." },
+    { "name": "NUM_CORES",       "id": 26, "access": "ro", "desc": "Number of cores in the cluster." }
+  ],
+
+  "operand_kinds": {
+    "reg":   "General purpose register (x0..x31 or alias).",
+    "csr":   "CSR name or number.",
+    "int":   "Signed 32-bit integer immediate.",
+    "f32":   "32-bit float immediate, stored as IEEE-754 bits.",
+    "pcrel": "Label; encoded as signed instruction offset relative to this instruction.",
+    "mask":  "Wait mask: bits 0-15 DMA tags, bit 16 MXU, bit 17 VPU."
+  },
+
+  "instructions": [
+    { "mnemonic": "nop",   "opcode": "0x00", "unit": "scalar", "operands": [], "desc": "No operation." },
+    { "mnemonic": "halt",  "opcode": "0x01", "unit": "scalar", "operands": [], "desc": "Wait for all units to drain, then stop the kernel." },
+    { "mnemonic": "li",    "opcode": "0x02", "unit": "scalar", "operands": [["rd", "reg"], ["imm", "int"]], "desc": "rd = sext(imm)" },
+
+    { "mnemonic": "add",   "opcode": "0x10", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 + rs2" },
+    { "mnemonic": "sub",   "opcode": "0x11", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 - rs2" },
+    { "mnemonic": "mul",   "opcode": "0x12", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 * rs2" },
+    { "mnemonic": "and",   "opcode": "0x13", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 & rs2" },
+    { "mnemonic": "or",    "opcode": "0x14", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 | rs2" },
+    { "mnemonic": "xor",   "opcode": "0x15", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 ^ rs2" },
+    { "mnemonic": "sll",   "opcode": "0x16", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 << (rs2 & 63)" },
+    { "mnemonic": "srl",   "opcode": "0x17", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 >> (rs2 & 63), logical" },
+    { "mnemonic": "slt",   "opcode": "0x18", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = (rs1 < rs2) ? 1 : 0, signed" },
+    { "mnemonic": "div",   "opcode": "0x19", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 / rs2, signed, traps on division by zero" },
+    { "mnemonic": "rem",   "opcode": "0x1a", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["rs2", "reg"]], "desc": "rd = rs1 % rs2, signed, traps on division by zero" },
+
+    { "mnemonic": "addi",  "opcode": "0x20", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = rs1 + sext(imm)" },
+    { "mnemonic": "muli",  "opcode": "0x21", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = rs1 * sext(imm)" },
+    { "mnemonic": "slli",  "opcode": "0x22", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = rs1 << (imm & 63)" },
+    { "mnemonic": "srli",  "opcode": "0x23", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = rs1 >> (imm & 63), logical" },
+    { "mnemonic": "andi",  "opcode": "0x24", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = rs1 & sext(imm)" },
+
+    { "mnemonic": "beq",   "opcode": "0x30", "unit": "scalar", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "pcrel"]], "desc": "if rs1 == rs2: pc += imm" },
+    { "mnemonic": "bne",   "opcode": "0x31", "unit": "scalar", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "pcrel"]], "desc": "if rs1 != rs2: pc += imm" },
+    { "mnemonic": "blt",   "opcode": "0x32", "unit": "scalar", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "pcrel"]], "desc": "if rs1 < rs2 (signed): pc += imm" },
+    { "mnemonic": "bge",   "opcode": "0x33", "unit": "scalar", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "pcrel"]], "desc": "if rs1 >= rs2 (signed): pc += imm" },
+    { "mnemonic": "jmp",   "opcode": "0x34", "unit": "scalar", "operands": [["imm", "pcrel"]], "desc": "pc += imm" },
+
+    { "mnemonic": "lw",    "opcode": "0x38", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "rd = sext(SRAM32[rs1 + imm])" },
+    { "mnemonic": "sw",    "opcode": "0x39", "unit": "scalar", "operands": [["rs2", "reg"], ["rs1", "reg"], ["imm", "int"]], "desc": "SRAM32[rs1 + imm] = rs2[31:0]" },
+
+    { "mnemonic": "csrw",  "opcode": "0x3c", "unit": "scalar", "operands": [["rd", "csr"], ["rs1", "reg"]], "desc": "CSR[rd] = rs1 (CSR id is encoded in the rd field)" },
+    { "mnemonic": "csrwi", "opcode": "0x3d", "unit": "scalar", "operands": [["rd", "csr"], ["imm", "int"]], "desc": "CSR[rd] = sext(imm) (CSR id is encoded in the rd field)" },
+    { "mnemonic": "csrr",  "opcode": "0x3e", "unit": "scalar", "operands": [["rd", "reg"], ["rs1", "csr"]], "desc": "rd = CSR[rs1] (CSR id is encoded in the rs1 field)" },
+
+    { "mnemonic": "dma.ld", "opcode": "0x40", "unit": "dma", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "int"]], "desc": "Async 2D copy DRAM[rs2] -> SRAM[rs1] using DMA_* CSRs; imm = tag (0..15)." },
+    { "mnemonic": "dma.st", "opcode": "0x41", "unit": "dma", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "int"]], "desc": "Async 2D copy SRAM[rs1] -> DRAM[rs2] using DMA_* CSRs; imm = tag (0..15)." },
+
+    { "mnemonic": "mxu.mm", "opcode": "0x48", "unit": "mxu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["rs3", "reg"], ["imm", "int"]], "desc": "Async C[rs1] (+)= A[rs2] x B[rs3] using MXU_* CSRs; imm bit0 = accumulate." },
+
+    { "mnemonic": "v.fill",     "opcode": "0x50", "unit": "vpu", "operands": [["rs1", "reg"], ["imm", "f32"]], "desc": "dst[i] = imm" },
+    { "mnemonic": "v.add",      "opcode": "0x51", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["rs3", "reg"]], "desc": "dst[i] = a[i] + b[i]" },
+    { "mnemonic": "v.sub",      "opcode": "0x52", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["rs3", "reg"]], "desc": "dst[i] = a[i] - b[i]" },
+    { "mnemonic": "v.mul",      "opcode": "0x53", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["rs3", "reg"]], "desc": "dst[i] = a[i] * b[i]" },
+    { "mnemonic": "v.max",      "opcode": "0x54", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["rs3", "reg"]], "desc": "dst[i] = max(a[i], b[i])" },
+    { "mnemonic": "v.adds",     "opcode": "0x55", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "f32"]], "desc": "dst[i] = a[i] + imm" },
+    { "mnemonic": "v.muls",     "opcode": "0x56", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"], ["imm", "f32"]], "desc": "dst[i] = a[i] * imm" },
+    { "mnemonic": "v.exp",      "opcode": "0x57", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[i] = exp(a[i])" },
+    { "mnemonic": "v.relu",     "opcode": "0x58", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[i] = max(a[i], 0)" },
+    { "mnemonic": "v.rsqrt",    "opcode": "0x59", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[i] = 1 / sqrt(a[i])" },
+    { "mnemonic": "v.rsum",     "opcode": "0x5a", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[0] = sum(a[0..VPU_LEN))" },
+    { "mnemonic": "v.rmax",     "opcode": "0x5b", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[0] = max(a[0..VPU_LEN))" },
+    { "mnemonic": "v.cvt.bf16", "opcode": "0x5c", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "bf16 dst[i] = round_to_nearest_even(f32 a[i])" },
+    { "mnemonic": "v.cvt.f32",  "opcode": "0x5d", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "f32 dst[i] = bf16 a[i]" },
+    { "mnemonic": "v.copy",     "opcode": "0x5e", "unit": "vpu", "operands": [["rs1", "reg"], ["rs2", "reg"]], "desc": "dst[i] = a[i] (32-bit elements)" },
+
+    { "mnemonic": "wait",  "opcode": "0x60", "unit": "scalar", "operands": [["imm", "mask"]], "desc": "Stall until all outstanding operations selected by the mask have completed." }
+  ]
+}

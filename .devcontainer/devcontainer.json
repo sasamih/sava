@@ -1,0 +1,23 @@
+{
+  "name": "SAVA dev",
+  "build": {
+    "dockerfile": "../docker/Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "llvm-vs-code-extensions.vscode-mlir",
+        "ms-python.python"
+      ],
+      "settings": {
+        "cmake.useCMakePresets": "always",
+        "python.analysis.extraPaths": ["/workspace/python"]
+      }
+    }
+  }
+}

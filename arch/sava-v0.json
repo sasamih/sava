@@ -1,0 +1,40 @@
+{
+  "name": "sava-v0",
+  "comment": "Microarchitecture parameters of the SAVA v0 core. Used as simulator defaults (via generated header) and by the compiler for tiling/legality decisions.",
+
+  "clock_ghz": 1.0,
+  "cores_per_chip": 4,
+  "simulated_cores": 1,
+
+  "dram": {
+    "bytes": 268435456,
+    "bandwidth_bytes_per_cycle": 64,
+    "latency_cycles": 200
+  },
+
+  "sram": {
+    "bytes": 1048576,
+    "alignment": 64
+  },
+
+  "dma": {
+    "tags": 16,
+    "queue_depth": 8
+  },
+
+  "mxu": {
+    "array_dim": 32,
+    "max_m": 128,
+    "max_n": 128,
+    "max_k": 128,
+    "f32_slowdown": 4,
+    "queue_depth": 4
+  },
+
+  "vpu": {
+    "lanes": 16,
+    "latency_cycles": 8,
+    "transcendental_slowdown": 4,
+    "queue_depth": 4
+  }
+}
