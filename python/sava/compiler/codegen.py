@@ -17,8 +17,12 @@ Responsibilities that a real backend would split into separate passes:
   * memory planning   - every SRAM alloc gets a static address (bump allocator),
   * register allocation - scoped allocation of x9..x31 (a0..a7 hold arguments),
   * synchronization   - a `wait` is inserted before any command that conflicts
-                        with an un-waited command of another unit; loops are
-                        fenced at entry and at the end of each iteration,
+                        with an un-waited command of another unit. Conflicts
+                        are computed on byte ranges, so the two slots of a
+                        double-buffered tile are independent. Loops are not
+                        fenced: at the end of the body the code waits only for
+                        in-flight commands that conflict with an access of the
+                        next iteration (loop-carried dependencies),
   * CSR caching       - redundant csrwi writes are skipped.
 """
 
@@ -63,11 +67,23 @@ class Buffer:
     shape: tuple[int, ...]
     strides: tuple[int, ...]  # in elements
     elem: str
-    ident: str                # identity used for dependency tracking
+    ident: str                # dram: "arg<i>"; sram: "sram<i>" (allocation)
+    alloc_range: tuple[int, int] | None = None  # sram: bytes of the whole allocation
 
     @property
     def esize(self) -> int:
         return ELEM_BYTES[self.elem]
+
+    def footprint(self) -> Footprint:
+        """Memory touched by this view, used for dependency tracking."""
+        if self.space == "dram":
+            return (self.ident, 0, 1 << 62)  # only the DMA touches DRAM: no finer tracking needed
+        if isinstance(self.offset, Const) and self.shape:
+            lo = self.base + self.offset.value * self.esize
+            extent = sum((d - 1) * s for d, s in zip(self.shape, self.strides)) + 1
+            return ("sram", lo, lo + extent * self.esize)
+        lo, hi = self.alloc_range  # dynamic offset: assume the whole allocation
+        return ("sram", lo, hi)
 
     def as_2d(self) -> tuple[int, int, int] | None:
         """(rows, cols, row_stride) if the view is a 2D strided block."""
@@ -88,12 +104,25 @@ class Buffer:
         return b is not None and (b[0] == 1 or b[2] == b[1])
 
 
+Footprint = tuple  # (memory key, lo, hi): byte range [lo, hi) in "sram" or a DRAM argument
+
+
+def _overlap(xs: list[Footprint], ys: list[Footprint]) -> bool:
+    return any(x[0] == y[0] and x[1] < y[2] and y[1] < x[2] for x in xs for y in ys)
+
+
 @dataclass
 class _Pending:
+    """A command that has been issued but not waited for."""
     unit: str  # dma | mxu | vpu
     tag: int
-    reads: set[str]
-    writes: set[str]
+    reads: list[Footprint]
+    writes: list[Footprint]
+
+    def conflicts(self, unit: str, reads: list[Footprint], writes: list[Footprint]) -> bool:
+        """RAW/WAR/WAW with an access by `unit` (commands on one unit run in order)."""
+        return self.unit != unit and (_overlap(writes, self.reads + self.writes)
+                                      or _overlap(reads, self.writes))
 
 
 @dataclass
@@ -171,6 +200,7 @@ class KernelCodegen:
         self.sram_buffers = 0
         self.csr_cache: dict[str, int] = {}
         self.pending: list[_Pending] = []
+        self.accesses: list[tuple] = []  # every (unit, reads, writes) passed to sync(), in order
         self.next_tag = 0
         self.next_label = 0
 
@@ -269,10 +299,12 @@ class KernelCodegen:
         self.emit(f"wait {self._mask_text(mask)}")
         self.pending = [p for p in self.pending if not self._mask(p) & mask]
 
-    def sync(self, unit: str, reads: set[str], writes: set[str]):
+    def sync(self, unit: str, reads: list[Footprint], writes: list[Footprint]):
+        """Waits for every in-flight command the access by `unit` depends on."""
+        self.accesses.append((unit, reads, writes))
         mask = 0
         for p in self.pending:
-            if p.unit != unit and (writes & (p.reads | p.writes) or reads & p.writes):
+            if p.conflicts(unit, reads, writes):
                 mask |= self._mask(p)
         if mask:
             self.wait(mask)
@@ -284,7 +316,7 @@ class KernelCodegen:
         if mask:
             self.wait(mask)
 
-    def record(self, unit: str, reads: set[str], writes: set[str], tag: int = 0):
+    def record(self, unit: str, reads: list[Footprint], writes: list[Footprint], tag: int = 0):
         self.pending.append(_Pending(unit, tag, reads, writes))
 
     # ---- driver ---------------------------------------------------------------
@@ -407,18 +439,30 @@ class KernelCodegen:
             return str(x.value) if isinstance(x, Const) else x.name
         self.comment(f"scf.for {iv} = {fmt(lb)} to {fmt(ub)} step {step.value}")
         ub_reg = self.in_reg(ub)
-        self.fence()
+        runs_at_least_once = isinstance(lb, Const) and isinstance(ub, Const) and lb.value < ub.value
+        if not runs_at_least_once:
+            # Waits inside the body might not execute; settle everything up front.
+            self.fence()
         if isinstance(lb, Const):
             self.emit(f"li {iv}, {self.check_imm(lb.value, 'loop bound')}")
         else:
             self.emit(f"mv {iv}, {lb.name}")
-        if not (isinstance(lb, Const) and isinstance(ub, Const) and lb.value < ub.value):
+        if not runs_at_least_once:
             self.emit(f"bge {iv}, {ub_reg[0]}, {end}")
         self.label(head)
+        first_access = len(self.accesses)
         self.regs.push()
         self.gen_block(body)
         self.regs.pop()
-        self.fence()
+        # Loop-carried dependencies: commands still in flight at the end of an
+        # iteration must complete before the next iteration touches the same
+        # memory. Waits needed within one iteration were already emitted.
+        mask = 0
+        for p in self.pending:
+            if any(p.conflicts(*access) for access in self.accesses[first_access:]):
+                mask |= self._mask(p)
+        if mask:
+            self.wait(mask)
         self.emit(f"addi {iv}, {iv}, {self.check_imm(step.value, 'loop step')}")
         self.emit(f"blt {iv}, {ub_reg[0]}, {head}")
         self.label(end)
@@ -449,26 +493,30 @@ class KernelCodegen:
         self.sram_buffers += 1
         self.comment(f"sram[0x{addr:x}..0x{addr + nbytes:x}) = {mt}")
         self.values[op.results[0]] = Buffer("sram", addr, Const(0), tuple(mt.shape), strides, elem,
-                                            f"sram{self.sram_buffers}")
+                                            f"sram{self.sram_buffers}", (addr, addr + nbytes))
 
     def op_memref_dealloc(self, op):
         pass
 
     def op_memref_reinterpret_cast(self, op):
         src = self.get(op.operands[0])
-        mt, strides, offset = _memref_layout(op.results[0].type)
-        if offset == DYNAMIC:
+        mt, strides, _ = _memref_layout(op.results[0].type)
+        # The op's own static_offsets is authoritative: the result type may say
+        # `offset: ?` even when the op carries a constant offset.
+        static_offset = list(ir.DenseI64ArrayAttr(op.attributes["static_offsets"]))[0]
+        if static_offset == DYNAMIC:
             off = self.get(op.operands[1])
         else:
-            off = Const(offset)
+            off = Const(static_offset)
         self.values[op.results[0]] = Buffer(src.space, src.base, off, tuple(mt.shape), strides,
-                                            src.elem, src.ident)
+                                            src.elem, src.ident, src.alloc_range)
 
     def op_memref_extract_strided_metadata(self, op):
         src = self.get(op.operands[0])
         mt, strides, offset = _memref_layout(op.operands[0].type)
         results = list(op.results)
-        self.values[results[0]] = Buffer(src.space, src.base, Const(0), (), (), src.elem, src.ident)
+        self.values[results[0]] = Buffer(src.space, src.base, Const(0), (), (), src.elem, src.ident,
+                                         src.alloc_range)
         self.values[results[1]] = src.offset if offset == DYNAMIC else Const(offset)
         rank = len(mt.shape)
         for i in range(rank):
@@ -487,12 +535,13 @@ class KernelCodegen:
         if src.space == "sram" and dst.space == "sram":
             if not (src.is_contiguous() and dst.is_contiguous()) or src.esize != 4:
                 raise CodegenError("SRAM->SRAM copies must be contiguous 32-bit data")
-            self.sync("vpu", {src.ident}, {dst.ident})
+            reads, writes = [src.footprint()], [dst.footprint()]
+            self.sync("vpu", reads, writes)
             self.set_csr("VPU_LEN", math.prod(src.shape))
             d, s = self.address(dst), self.address(src)
             self.emit(f"v.copy {d[0]}, {s[0]}")
             self.release(d, s)
-            self.record("vpu", {src.ident}, {dst.ident})
+            self.record("vpu", reads, writes)
             return
         if src.space == dst.space:
             raise CodegenError("DRAM->DRAM copies are not supported")
@@ -503,7 +552,8 @@ class KernelCodegen:
             raise CodegenError(f"copy is not expressible as a 2D DMA: {_op_text(op)}")
         rows, cols, _ = db
         eb = dram.esize
-        self.sync("dma", {src.ident}, {dst.ident})
+        reads, writes = [src.footprint()], [dst.footprint()]
+        self.sync("dma", reads, writes)
         self.set_csr("DMA_ROWS", rows)
         self.set_csr("DMA_ROW_BYTES", cols * eb)
         self.set_csr("DMA_DRAM_STRIDE", db[2] * eb)
@@ -513,7 +563,7 @@ class KernelCodegen:
         self.next_tag = (self.next_tag + 1) % self.cfg["dma"]["tags"]
         self.emit(f"{'dma.ld' if load else 'dma.st'} {s_addr[0]}, {d_addr[0]}, {tag}")
         self.release(s_addr, d_addr)
-        self.record("dma", {src.ident}, {dst.ident}, tag)
+        self.record("dma", reads, writes, tag)
         self._track_arg(dram, read=load, write=not load)
 
     # ---- compute ------------------------------------------------------------------
@@ -525,12 +575,13 @@ class KernelCodegen:
             raise CodegenError("linalg.fill is only supported on contiguous f32 SRAM buffers")
         if not isinstance(value, (Const, FConst)):
             raise CodegenError("linalg.fill value must be a constant")
-        self.sync("vpu", set(), {out.ident})
+        writes = [out.footprint()]
+        self.sync("vpu", [], writes)
         self.set_csr("VPU_LEN", math.prod(out.shape))
         d = self.address(out)
         self.emit(f"v.fill {d[0]}, {float(value.value)!r}")
         self.release(d)
-        self.record("vpu", set(), {out.ident})
+        self.record("vpu", [], writes)
 
     def op_linalg_matmul(self, op):
         if "indexing_maps" in op.attributes and str(op.attributes["indexing_maps"]) != DEFAULT_MATMUL_MAPS:
@@ -548,7 +599,8 @@ class KernelCodegen:
         if m > mxu["max_m"] or n > mxu["max_n"] or k > mxu["max_k"]:
             raise CodegenError(f"matmul tile {m}x{n}x{k} exceeds MXU limits "
                                f"{mxu['max_m']}x{mxu['max_n']}x{mxu['max_k']}; tile it first")
-        self.sync("mxu", {a.ident, b.ident, c.ident}, {c.ident})
+        reads, writes = [a.footprint(), b.footprint(), c.footprint()], [c.footprint()]
+        self.sync("mxu", reads, writes)
         self.set_csr("MXU_M", m)
         self.set_csr("MXU_N", n)
         self.set_csr("MXU_K", k)
@@ -559,7 +611,7 @@ class KernelCodegen:
         rc, ra, rb = self.address(c), self.address(a), self.address(b)
         self.emit(f"mxu.mm {rc[0]}, {ra[0]}, {rb[0]}, 1")  # 1 = accumulate into C
         self.release(rc, ra, rb)
-        self.record("mxu", {a.ident, b.ident, c.ident}, {c.ident})
+        self.record("mxu", reads, writes)
 
 
 def generate(module: ir.Module, cfg: dict, arg_names: list[str] | None = None) -> str:

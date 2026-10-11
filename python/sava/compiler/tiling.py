@@ -6,6 +6,20 @@ For every linalg.matmul the compiler picks tile sizes (tm, tn, tk) that
   * divide the problem size (v0 has no remainder/padding handling),
   * keep A, B and the f32 accumulator tile within an SRAM budget.
 
+It also decides whether the matmul should be double buffered (M1, see
+docs/roadmap.md): two SRAM slots for the A and B tiles, so the DMA of K step
+k+1 can overlap the MXU work of step k. It is done when
+
+  * the K loop has an even number of steps, at least two (k / tk >= 2) --
+    with one step there is nothing to prefetch, and the transformation
+    unrolls the loop by 2 so that every access uses a constant slot,
+  * both slots of A and B plus the accumulator fit in SRAM. With the current
+    budget (tiles use at most half of SRAM) this always holds; the check is kept
+    explicit because the budget will change (e.g. fused epilogues in M2).
+
+The decision is recorded in MatmulPlan.double_buffer and carried out by
+double_buffer.py (stage 04d).
+
 It then emits a transform-dialect script that, per matmul,
 
   1. tiles the parallel dims (M, N) and fuses the producing linalg.fill,
@@ -43,10 +57,12 @@ class MatmulPlan:
     k: int
     elem: str
     tiles: tuple[int, int, int]
+    double_buffer: bool = False
 
-    def sram_bytes(self) -> int:
+    def sram_bytes(self, slot_num : int = 1) -> int:
+        """SRAM footprint with `slot_num` copies of the A and B tiles (C is always one)."""
         tm, tn, tk = self.tiles
-        return (tm * tk + tk * tn) * ELEM_BYTES[self.elem] + tm * tn * 4
+        return slot_num * (tm * tk + tk * tn) * ELEM_BYTES[self.elem] + tm * tn * 4
 
 
 def _divisors_desc(n: int, limit: int) -> list[int]:
@@ -69,7 +85,8 @@ def choose_matmul_tiles(m: int, n: int, k: int, elem: str, cfg: dict) -> tuple[i
 
 
 def plan_module(module: ir.Module, cfg: dict) -> list[MatmulPlan]:
-    """Annotates each linalg.matmul with `sava.op_id` and picks its tiles."""
+    """Annotates each linalg.matmul with `sava.op_id`, picks its tiles and
+    decides whether to double buffer it (see the module docstring)."""
     plans: list[MatmulPlan] = []
 
     def visit(op: ir.Operation):
@@ -82,10 +99,12 @@ def plan_module(module: ir.Module, cfg: dict) -> list[MatmulPlan]:
         if "indexing_maps" in op.attributes and str(op.attributes["indexing_maps"]) != DEFAULT_MATMUL_MAPS:
             raise TilingError(f"transposed/broadcast matmul variants are not supported yet: {op}")
         a, b, c = (ir.RankedTensorType(v.type) for v in op.operands)
+
         if str(a.element_type) != str(b.element_type) or str(a.element_type) not in ("f32", "bf16") \
                 or str(c.element_type) != "f32":
             raise TilingError("matmul must be f32 x f32 -> f32 or bf16 x bf16 -> f32, got "
                               f"{a.element_type} x {b.element_type} -> {c.element_type}")
+
         producer = op.operands[2].owner  # an op, or a Block for block arguments
         if getattr(getattr(producer, "operation", producer), "name", None) != "linalg.fill":
             raise TilingError("v0 expects the matmul accumulator to be produced by linalg.fill")
@@ -93,8 +112,13 @@ def plan_module(module: ir.Module, cfg: dict) -> list[MatmulPlan]:
         n = b.shape[1]
         elem = str(a.element_type)
         op_id = len(plans)
+        tm, tn, tk = choose_matmul_tiles(m, n, k, elem, cfg)
+        mp = MatmulPlan(op_id, m, n, k, elem, (tm, tn, tk))
+        k_steps = k // tk
+        mp.double_buffer = (k_steps >= 2 and k_steps % 2 == 0
+                            and mp.sram_bytes(2) <= cfg["sram"]["bytes"])
         op.attributes["sava.op_id"] = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), op_id)
-        plans.append(MatmulPlan(op_id, m, n, k, elem, choose_matmul_tiles(m, n, k, elem, cfg)))
+        plans.append(mp)
 
     visit(module.operation)
     if not plans:
@@ -114,7 +138,7 @@ def make_transform_script(plans: list[MatmulPlan]) -> str:
         v = f"%mm{p.op_id}"
         lines += [
             f"    // matmul #{p.op_id}: {p.m}x{p.k} * {p.k}x{p.n} ({p.elem}) -> tiles "
-            f"M={tm} N={tn} K={tk}, SRAM {p.sram_bytes()} B",
+            f"M={tm} N={tn} K={tk}, SRAM {p.sram_bytes(2 if p.double_buffer else 1)} B",
             f"    {v} = transform.structured.match ops{{[\"linalg.matmul\"]}} "
             f"attributes {{sava.op_id = {p.op_id} : i64}} in %root : ({any_op}) -> {any_op}",
             "    // 1. Tile M and N; fuse the accumulator init (linalg.fill) into the loop nest.",
@@ -138,6 +162,33 @@ def make_transform_script(plans: list[MatmulPlan]) -> str:
         "    transform.apply_patterns to %funcs {",
         "      transform.apply_patterns.canonicalization",
         f"    }} : {any_op}",
+        "    transform.yield",
+        "  }",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def make_post_bufferize_script(plans: list[MatmulPlan]) -> str:
+    """Memref-level schedule, applied to 04a-hoisted.mlir (stage 04b).
+
+    At this point A, B and C are `memref.alloc`s in SRAM at the function entry,
+    and every matmul still carries its `sava.op_id`. The generated script is an
+    empty hook for experiments with buffer-level transformations; double
+    buffering itself is done afterwards by double_buffer.py (stage 04d).
+    """
+    any_op = "!transform.any_op"
+    lines = [
+        "// Generated by sava.compiler.tiling -- memref-level schedule, applied to",
+        "// 04a-hoisted.mlir. Edit and pass back with --post-bufferize-script.",
+    ]
+    for p in plans:
+        state = "planned (applied by double_buffer.py in stage 04d)" if p.double_buffer \
+            else "not planned"
+        lines.append(f"// matmul #{p.op_id} (sava.op_id = {p.op_id}): double buffering {state}")
+    lines += [
+        "module attributes {transform.with_named_sequence} {",
+        f"  transform.named_sequence @__transform_main(%root: {any_op} {{transform.readonly}}) {{",
         "    transform.yield",
         "  }",
         "}",

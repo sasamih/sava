@@ -28,10 +28,21 @@ the DMA serialized behind it. The goal is to measure every change with
    or a peeled first iteration (`transform.loop.peel`).
 3. **Double buffering.** Ping-pong A/B buffers so that the DMA for iteration
    k+1 overlaps the MXU work of iteration k. Two parts: the schedule
-   (`transform.structured.multibuffer`/`memref.multi_buffer`, or software
-   pipelining) and smarter synchronization in codegen (wait on a specific
-   tag instead of fencing the loop).
+   (`transform.memref.multibuffer`, unrolling the K loop by 2 so slots are
+   static, and software pipelining so the prefetch is issued before the
+   matmul) and smarter synchronization in codegen (wait on a specific tag
+   instead of fencing the loop). The prefetch order matters on SAVA because
+   `wait mxu` waits for *all* MXU commands.
 4. **Better tile selection** for bf16 and for GEMV shapes (M=1, decode).
+
+### Status
+
+| Step | State |
+|---|---|
+| 1. bf16 | **done** for bf16 inputs from the frontend (`examples/matmul/matmul2k.mlir`): 13.09M → 4.08M cycles. `run.py` generates bf16 inputs and IREE references. An on-chip f32→bf16 conversion pass is still open. |
+| 2. remove `v.fill` | open |
+| 3. double buffering | **done** for the K loop: decision in `tiling.py` (even number of K steps), SRAM hoisting (04a), the pipelining pass `double_buffer.py` (04d, static slots, unrolled ×2, prefetch before the matmul), and codegen synchronization on byte ranges with loop-carried waits instead of fences. `matmul2k`: 4.08M → **2.83M cycles**, MXU 65% → 94%, within 0.3% of the hand-written reference `examples/matmul/matmul2k_db_reference.s`. **Open:** overlap across C tiles (prologue DMA of the next tile, `dma.st` of the previous one). |
+| 4. tile selection | open |
 
 ## M2: Element-wise fusion and the VPU
 

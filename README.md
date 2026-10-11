@@ -57,21 +57,25 @@ python examples/matmul/run.py      # compile -> run on SAVA -> compare with nump
 Expected output (abridged):
 
 ```
-compiled @matmul: 58 instructions, stages in build/examples/matmul/
-  matmul #0: 256x512 * 512x256, tiles M=128 N=128 K=128
+compiled @matmul: 99 instructions, stages in build/examples/matmul/
+  matmul #0: 256x512 * 512x256, tiles M=128 N=128 K=128, double_buffer=True
 SAVA simulator vs exact (f64): max abs error 8.439e-05, relative 8.82e-07  ok
 SAVA simulator vs IREE CPU:    max abs error 2.670e-05, relative 2.79e-07  ok
-cycles              211307  (211.31 us @ 1.0 GHz)
-mxu  ops     16  util  78.5%  macs 33554432  (317.6 GFLOP/s)
+cycles              180033  (180.03 us @ 1.0 GHz)
+mxu  ops     16  util  92.1%  macs 33554432  (372.8 GFLOP/s)
 PASS
 ```
+
+`--no-double-buffer` turns off the double-buffering pass for comparison, and
+`--mlir examples/matmul/matmul2k.mlir` runs the larger bf16 example.
 
 ## Tools
 
 ```sh
 # Compiler: MLIR -> .sbin (+ every intermediate stage and a reproduce.sh for iree-opt)
 python -m sava.compiler examples/matmul/matmul.mlir -o build/matmul.sbin --dump-dir build/matmul -S
-python -m sava.compiler model.mlir --transform-script my_schedule.mlir    # try your own schedule
+python -m sava.compiler model.mlir --transform-script my_schedule.mlir    # your own tensor-level schedule
+python -m sava.compiler model.mlir --post-bufferize-script my_memref.mlir # your own memref-level schedule (stage 04b)
 
 # Assembler / disassembler
 python -m sava.asm examples/asm/relu_scale.s -o build/relu_scale.sbin
