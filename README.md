@@ -59,8 +59,8 @@ Expected output (abridged):
 ```
 compiled @matmul: 58 instructions, stages in build/examples/matmul/
   matmul #0: 256x512 * 512x256, tiles M=128 N=128 K=128
-SAVA simulator vs numpy:   max abs error 8.392e-05
-SAVA simulator vs IREE CPU: max abs error 2.670e-05
+SAVA simulator vs exact (f64): max abs error 8.439e-05, relative 8.82e-07  ok
+SAVA simulator vs IREE CPU:    max abs error 2.670e-05, relative 2.79e-07  ok
 cycles              211307  (211.31 us @ 1.0 GHz)
 mxu  ops     16  util  78.5%  macs 33554432  (317.6 GFLOP/s)
 PASS
